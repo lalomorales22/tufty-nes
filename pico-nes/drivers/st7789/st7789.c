@@ -1,0 +1,367 @@
+/**
+ * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include <stdio.h>
+#include <math.h>
+
+#include "pico/stdlib.h"
+#include "hardware/pio.h"
+#include "hardware/gpio.h"
+
+#include "graphics.h"
+
+#include <string.h>
+#include <pico/multicore.h>
+
+#ifdef TFT_PARALLEL
+#include "st7789_parallel.pio.h"
+#else
+#include "st7789.pio.h"
+#endif
+#include "hardware/dma.h"
+
+/*
+ * TUFTY2350 BIT-BANG DISPLAY DRIVER
+ * PIO doesn't work on RP2350B for GPIO 32-39 data bus (likely SDK issue).
+ * Instead, we drive the display with direct GPIO writes.
+ * Performance: ~40-55 FPS at 252MHz, good enough for NES emulation.
+ */
+#ifdef TUFTY2350
+
+static void __attribute__((noinline)) tufty_lcd_put(uint8_t val) {
+    for (int i = 0; i < 8; i++)
+        gpio_put(32 + i, (val >> i) & 1);
+    gpio_put(30, 0);  // WR low
+    gpio_put(30, 1);  // WR high (data latched on rising edge)
+}
+
+static void __attribute__((noinline)) tufty_lcd_put_pixel(uint16_t val) {
+    tufty_lcd_put(val >> 8);
+    tufty_lcd_put(val & 0xFF);
+}
+
+// Redirect all PIO display calls to bit-bang equivalents
+#define st7789_lcd_put(pio, sm, x)           tufty_lcd_put(x)
+#define st7789_lcd_put_pixel(pio, sm, x)     tufty_lcd_put_pixel(x)
+#define st7789_lcd_wait_idle(pio, sm)         ((void)0)
+#define st7789_set_pixel_mode(pio, sm, mode)  ((void)0)
+
+#endif // TUFTY2350
+
+#ifndef SCREEN_WIDTH
+#define SCREEN_WIDTH 320
+#endif
+
+#ifndef SCREEN_HEIGHT
+#define SCREEN_HEIGHT 240
+#endif
+
+#ifdef TFT_PARALLEL
+// Parallel: clock divider for ~60MHz write speed at 252MHz sys clock
+#define SERIAL_CLK_DIV 2.0f
+#else
+// 126MHz SPI
+#define SERIAL_CLK_DIV 3.0f
+#endif
+
+#define MADCTL_MY  (1 << 7)
+#define MADCTL_MX  (1 << 6)
+#define MADCTL_MV  (1 << 5)
+#define MADCTL_ML  (1 << 4)
+#define MADCTL_BGR (1 << 3)
+#define MADCTL_MH  (1 << 2)
+#define MADCTL_BGR_PIXEL_ORDER (1<<3)
+#define MADCTL_ROW_COLUMN_EXCHANGE (1<<5)
+#define MADCTL_COLUMN_ADDRESS_ORDER_SWAP (1<<6)
+
+
+#define CHECK_BIT(var, pos) (((var)>>(pos)) & 1)
+
+static uint sm = 0;
+static PIO pio = pio0;
+#ifndef TUFTY2350
+static uint st7789_chan;
+#endif
+
+uint16_t __scratch_y("tft_palette") palette[256];
+
+uint8_t* text_buffer = NULL;
+static uint8_t* graphics_buffer = NULL;
+
+static uint graphics_buffer_width = 0;
+static uint graphics_buffer_height = 0;
+static int graphics_buffer_shift_x = 0;
+static int graphics_buffer_shift_y = 0;
+
+enum graphics_mode_t graphics_mode = GRAPHICSMODE_DEFAULT;
+
+static const uint8_t init_seq[] = {
+    1, 20, 0x01, // Software reset
+    1, 10, 0x11, // Exit sleep mode
+    2, 2, 0x3a, 0x55, // Set colour mode to 16 bit
+#ifdef ILI9341
+    #ifdef INVERSION
+    2, 0, 0x36, MADCTL_MY | MADCTL_MX | MADCTL_ROW_COLUMN_EXCHANGE | MADCTL_BGR_PIXEL_ORDER,
+    #else
+    2, 0, 0x36, MADCTL_ROW_COLUMN_EXCHANGE | MADCTL_BGR_PIXEL_ORDER,
+    #endif
+#else
+    // ST7789
+    2, 0, 0x36, MADCTL_COLUMN_ADDRESS_ORDER_SWAP | MADCTL_ROW_COLUMN_EXCHANGE,
+#endif
+    5, 0, 0x2a, 0x00, 0x00, SCREEN_WIDTH >> 8, SCREEN_WIDTH & 0xff, // CASET
+    5, 0, 0x2b, 0x00, 0x00, SCREEN_HEIGHT >> 8, SCREEN_HEIGHT & 0xff, // RASET
+#ifdef INVERSION
+    1, 2, 0x21, // Inversion ON
+#else
+    1, 2, 0x20, // Inversion OFF
+#endif
+    1, 2, 0x13, // Normal display on
+    1, 2, 0x29, // Main screen turn on
+    0 // Terminate list
+};
+
+static inline void lcd_set_dc_cs(const bool dc, const bool cs) {
+    sleep_us(5);
+    gpio_put_masked((1u << TFT_DC_PIN) | (1u << TFT_CS_PIN), !!dc << TFT_DC_PIN | !!cs << TFT_CS_PIN);
+    sleep_us(5);
+}
+
+static inline void lcd_write_cmd(const uint8_t* cmd, size_t count) {
+    st7789_lcd_wait_idle(pio, sm);
+    lcd_set_dc_cs(0, 0);
+    st7789_lcd_put(pio, sm, *cmd++);
+    if (count >= 2) {
+        st7789_lcd_wait_idle(pio, sm);
+        lcd_set_dc_cs(1, 0);
+        for (size_t i = 0; i < count - 1; ++i)
+            st7789_lcd_put(pio, sm, *cmd++);
+    }
+    st7789_lcd_wait_idle(pio, sm);
+    lcd_set_dc_cs(1, 1);
+}
+
+static inline void lcd_set_window(const uint16_t x,
+                                  const uint16_t y,
+                                  const uint16_t width,
+                                  const uint16_t height) {
+    static uint8_t screen_width_cmd[] = { 0x2a, 0x00, 0x00, SCREEN_WIDTH >> 8, SCREEN_WIDTH & 0xff };
+    static uint8_t screen_height_command[] = { 0x2b, 0x00, 0x00, SCREEN_HEIGHT >> 8, SCREEN_HEIGHT & 0xff };
+    screen_width_cmd[2] = x;
+    screen_width_cmd[4] = x + width - 1;
+
+    screen_height_command[2] = y;
+    screen_height_command[4] = y + height - 1;
+    lcd_write_cmd(screen_width_cmd, 5);
+    lcd_write_cmd(screen_height_command, 5);
+}
+
+static inline void lcd_init(const uint8_t* init_seq) {
+    const uint8_t* cmd = init_seq;
+    while (*cmd) {
+        lcd_write_cmd(cmd + 2, *cmd);
+        sleep_ms(*(cmd + 1) * 5);
+        cmd += *cmd + 2;
+    }
+}
+
+static inline void start_pixels() {
+    const uint8_t cmd = 0x2c; // RAMWR
+    st7789_lcd_wait_idle(pio, sm);
+    st7789_set_pixel_mode(pio, sm, false);
+    lcd_write_cmd(&cmd, 1);
+    st7789_set_pixel_mode(pio, sm, true);
+    lcd_set_dc_cs(1, 0);
+}
+
+void stop_pixels() {
+    st7789_lcd_wait_idle(pio, sm);
+    lcd_set_dc_cs(1, 1);
+    st7789_set_pixel_mode(pio, sm, false);
+}
+
+#ifndef TUFTY2350
+void create_dma_channel() {
+    st7789_chan = dma_claim_unused_channel(true);
+
+    dma_channel_config c = dma_channel_get_default_config(st7789_chan);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_16);
+    channel_config_set_dreq(&c, pio_get_dreq(pio, sm, true));
+    channel_config_set_read_increment(&c, true);
+    channel_config_set_write_increment(&c, false);
+
+    dma_channel_configure(
+        st7789_chan,
+        &c,
+        &pio->txf[sm],
+        NULL,
+        0,
+        false
+    );
+}
+#endif
+
+void graphics_init() {
+#ifdef TUFTY2350
+    // Bit-bang mode: init display pins as regular GPIO (no PIO needed)
+    for (int i = 32; i <= 39; i++) {
+        gpio_init(i);
+        gpio_set_dir(i, GPIO_OUT);
+        gpio_put(i, 0);
+    }
+    gpio_init(TFT_WR_PIN);
+    gpio_set_dir(TFT_WR_PIN, GPIO_OUT);
+    gpio_put(TFT_WR_PIN, 1);  // WR idle high
+
+    gpio_init(TFT_RD_PIN);
+    gpio_set_dir(TFT_RD_PIN, GPIO_OUT);
+    gpio_put(TFT_RD_PIN, 1);  // RD idle high
+
+    gpio_init(TFT_CS_PIN);
+    gpio_init(TFT_DC_PIN);
+    gpio_init(TFT_LED_PIN);
+    gpio_set_dir(TFT_CS_PIN, GPIO_OUT);
+    gpio_set_dir(TFT_DC_PIN, GPIO_OUT);
+    gpio_set_dir(TFT_LED_PIN, GPIO_OUT);
+
+    gpio_put(TFT_CS_PIN, 1);
+    lcd_init(init_seq);
+    gpio_put(TFT_LED_PIN, 1);
+
+#else
+    // PIO-based display driver (non-Tufty boards)
+#if defined(TFT_PARALLEL)
+    pio_set_gpio_base(pio, 16);
+#endif
+
+    const uint offset = pio_add_program(pio, &st7789_lcd_program);
+    sm = pio_claim_unused_sm(pio, true);
+
+#ifdef TFT_PARALLEL
+    st7789_lcd_program_init(pio, sm, offset, TFT_DB_BASE, TFT_WR_PIN, SERIAL_CLK_DIV);
+
+    // Set RD pin high (we never read from the display)
+    gpio_init(TFT_RD_PIN);
+    gpio_set_dir(TFT_RD_PIN, GPIO_OUT);
+    gpio_put(TFT_RD_PIN, 1);
+#else
+    // SPI mode: 1 data pin + CLK
+    st7789_lcd_program_init(pio, sm, offset, TFT_DATA_PIN, TFT_CLK_PIN, SERIAL_CLK_DIV);
+#endif
+
+    gpio_init(TFT_CS_PIN);
+    gpio_init(TFT_DC_PIN);
+    gpio_init(TFT_LED_PIN);
+    gpio_set_dir(TFT_CS_PIN, GPIO_OUT);
+    gpio_set_dir(TFT_DC_PIN, GPIO_OUT);
+    gpio_set_dir(TFT_LED_PIN, GPIO_OUT);
+
+#ifndef TFT_PARALLEL
+    // SPI mode has a separate RST pin
+    gpio_init(TFT_RST_PIN);
+    gpio_set_dir(TFT_RST_PIN, GPIO_OUT);
+    gpio_put(TFT_RST_PIN, 1);
+#endif
+
+    gpio_put(TFT_CS_PIN, 1);
+    lcd_init(init_seq);
+    gpio_put(TFT_LED_PIN, 1);
+
+    create_dma_channel();
+#endif // TUFTY2350
+
+    for (int i = 0; i < sizeof palette; i++) {
+        graphics_set_palette(i, 0x0000);
+    }
+    clrScr(0);
+}
+
+void inline graphics_set_mode(const enum graphics_mode_t mode) {
+    graphics_mode = -1;
+    sleep_ms(16);
+    clrScr(0);
+    graphics_mode = mode;
+}
+
+void graphics_set_buffer(uint8_t* buffer, const uint16_t width, const uint16_t height) {
+    graphics_buffer = buffer;
+    graphics_buffer_width = width;
+    graphics_buffer_height = height;
+}
+
+void graphics_set_textbuffer(uint8_t* buffer) {
+    text_buffer = buffer;
+}
+
+void graphics_set_offset(const int x, const int y) {
+    graphics_buffer_shift_x = x;
+    graphics_buffer_shift_y = y;
+}
+
+void clrScr(const uint8_t color) {
+    memset(&graphics_buffer[0], 0, graphics_buffer_height * graphics_buffer_width);
+    lcd_set_window(0, 0,SCREEN_WIDTH,SCREEN_HEIGHT);
+    uint32_t i = SCREEN_WIDTH * SCREEN_HEIGHT;
+    start_pixels();
+    while (--i) {
+        st7789_lcd_put_pixel(pio, sm, 0x0000);
+    }
+    stop_pixels();
+}
+
+#ifndef TUFTY2350
+void st7789_dma_pixels(const uint16_t* pixels, const uint num_pixels) {
+    dma_channel_wait_for_finish_blocking(st7789_chan);
+
+    dma_channel_hw_addr(st7789_chan)->read_addr = (uintptr_t)pixels;
+    dma_channel_hw_addr(st7789_chan)->transfer_count = num_pixels;
+    const uint ctrl = dma_channel_hw_addr(st7789_chan)->ctrl_trig;
+    dma_channel_hw_addr(st7789_chan)->ctrl_trig = ctrl | DMA_CH0_CTRL_TRIG_INCR_READ_BITS;
+}
+#endif
+
+void __inline __scratch_y("refresh_lcd") refresh_lcd() {
+    switch (graphics_mode) {
+        case TEXTMODE_DEFAULT:
+            lcd_set_window(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+            start_pixels();
+            for (int y = 0; y < SCREEN_HEIGHT; y++) {
+                st7789_lcd_put_pixel(pio, sm, 0x0000);
+
+                for (int x = 0; x < TEXTMODE_COLS; x++) {
+                    const uint16_t offset = (y / 8) * (TEXTMODE_COLS * 2) + x * 2;
+                    const uint8_t c = text_buffer[offset];
+                    const uint8_t colorIndex = text_buffer[offset + 1];
+                    const uint8_t glyph_row = font_6x8[c * 8 + y % 8];
+
+                    for (uint8_t bit = 0; bit < 6; bit++) {
+                        st7789_lcd_put_pixel(pio, sm, textmode_palette[(c && CHECK_BIT(glyph_row, bit))
+                                                                       ? colorIndex & 0x0F
+                                                                       : colorIndex >> 4 & 0x0F]);
+                    }
+                }
+                st7789_lcd_put_pixel(pio, sm, 0x0000);
+            }
+            stop_pixels();
+            break;
+        case GRAPHICSMODE_DEFAULT: {
+            const uint8_t* bitmap = graphics_buffer;
+            lcd_set_window(graphics_buffer_shift_x, graphics_buffer_shift_y, graphics_buffer_width,
+                           graphics_buffer_height);
+            uint32_t i = graphics_buffer_width * graphics_buffer_height;
+            start_pixels();
+            while (--i) {
+               st7789_lcd_put_pixel(pio, sm, palette[*bitmap++]);
+            }
+            stop_pixels();
+        }
+    }
+}
+
+
+void graphics_set_palette(const uint8_t i, const uint32_t color) {
+    palette[i] = (uint16_t)color;
+}

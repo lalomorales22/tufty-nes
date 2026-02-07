@@ -1,0 +1,80 @@
+;
+; 8-bit parallel ST7789 driver for Pimoroni Tufty 2350
+; Data on OUT pins 0-7 (DB0-DB7, GPIO 32-39)
+; WR strobe on side-set pin 0 (GPIO 30)
+;
+
+.program st7789_lcd
+.side_set 1
+
+.wrap_target
+    out pins, 8   side 0 ; output 8 data bits, WR low (active)
+    nop           side 1 ; WR high (data latched on rising edge)
+.wrap
+
+% c-sdk {
+static inline void st7789_lcd_program_init(PIO pio, uint sm, uint offset, uint db_base, uint wr_pin, float clk_div) {
+    // Init all 8 data pins (db_base to db_base+7)
+    for (int i = 0; i < 8; i++) {
+        pio_gpio_init(pio, db_base + i);
+    }
+    pio_gpio_init(pio, wr_pin);
+
+    // Set data pins and WR as outputs
+    pio_sm_set_consecutive_pindirs(pio, sm, db_base, 8, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, wr_pin, 1, true);
+
+    pio_sm_config c = st7789_lcd_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, wr_pin);
+    sm_config_set_out_pins(&c, db_base, 8);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_clkdiv(&c, clk_div);
+    sm_config_set_out_shift(&c, false, true, 8); // Left shift, autopull at 8
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+// Variant for RP2350B with PIO GPIO base offset.
+// Pin numbers are PIO-relative (already adjusted by caller).
+// pio_gpio_init must be called separately with actual GPIO numbers.
+static inline void st7789_lcd_program_init_with_base(PIO pio, uint sm, uint offset, uint db_pin, uint wr_pin, float clk_div) {
+    // Set data pins and WR as outputs (PIO-relative pin numbers)
+    pio_sm_set_consecutive_pindirs(pio, sm, db_pin, 8, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, wr_pin, 1, true);
+
+    pio_sm_config c = st7789_lcd_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, wr_pin);
+    sm_config_set_out_pins(&c, db_pin, 8);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_clkdiv(&c, clk_div);
+    sm_config_set_out_shift(&c, false, true, 8); // Left shift, autopull at 8
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void st7789_lcd_put(PIO pio, uint sm, uint8_t x) {
+    while (pio_sm_is_tx_fifo_full(pio, sm))
+        ;
+    *(volatile uint8_t*)&pio->txf[sm] = x;
+}
+
+static inline void st7789_set_pixel_mode(PIO pio, uint sm, bool pixel_mode) {
+    uint32_t shiftctrl = pio->sm[sm].shiftctrl;
+    shiftctrl &= ~PIO_SM0_SHIFTCTRL_PULL_THRESH_BITS;
+    shiftctrl |= (pixel_mode ? 16u : 8u) << PIO_SM0_SHIFTCTRL_PULL_THRESH_LSB;
+    pio->sm[sm].shiftctrl = shiftctrl;
+}
+
+static inline void st7789_lcd_put_pixel(PIO pio, uint sm, uint16_t x) {
+    while (pio_sm_is_tx_fifo_full(pio, sm))
+        ;
+    *(volatile uint16_t*)&pio->txf[sm] = x;
+}
+
+static inline void st7789_lcd_wait_idle(PIO pio, uint sm) {
+    uint32_t sm_stall_mask = 1u << (sm + PIO_FDEBUG_TXSTALL_LSB);
+    pio->fdebug = sm_stall_mask;
+    while (!(pio->fdebug & sm_stall_mask))
+        ;
+}
+%}
